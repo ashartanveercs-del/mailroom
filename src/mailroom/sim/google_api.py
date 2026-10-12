@@ -109,6 +109,13 @@ def to_email(message: Message) -> EmailMessage:
     return em
 
 
+def attachment_id_for(message_id: str, part_id: str) -> str:
+    """An attachment id shaped like the ones Gmail issues: opaque URL-safe base64, several
+    hundred characters long (far longer than message or Drive file ids)."""
+    seed = hashlib.sha256(f"{message_id}/{part_id}".encode()).digest()
+    return "ANGjdJ" + _b64url(seed * 9)[:378]
+
+
 @functools.lru_cache(maxsize=1024)
 def _gmail_resource(message: Message) -> tuple[dict[str, Any], dict[str, bytes]]:
     """The Gmail payload of a message and its attachments by id. A pure function of the
@@ -134,7 +141,7 @@ def _payload(part: EmailMessage, part_id: str, message_id: str,
     else:
         data = part.get_payload(decode=True) or b""
     if out["filename"] or mime == "message/rfc822" or part.get_content_disposition():
-        attachment_id = f"{message_id}-{part_id.replace('.', '-') or 'root'}"
+        attachment_id = attachment_id_for(message_id, part_id)
         attachments[attachment_id] = data
         out["body"] = {"attachmentId": attachment_id, "size": len(data)}
     else:

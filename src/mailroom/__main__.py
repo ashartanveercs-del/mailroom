@@ -25,6 +25,8 @@ from .google.auth import AuthError
 from .google.policy import google_allowlist
 from .guard import BlockedRequest
 from .http import HttpError, TransportError
+from .models import OutcomeKind
+from .pipeline import RunReport
 from .report import render_allowlist, render_counts, render_outcomes, render_run
 
 EXIT_OK, EXIT_FAILED, EXIT_CONFIG, EXIT_BLOCKED = 0, 1, 2, 3
@@ -119,8 +121,15 @@ def _live(args: argparse.Namespace, env: Mapping[str, str] | None) -> int:
     finally:
         app.close()
     print(json.dumps(report.to_dict(), indent=2) if args.json else render_run(report))
-    conflicts = any(o.kind.value == "conflict" for o in report.outcomes)
-    return EXIT_FAILED if conflicts or report.errors or not report.recovery.clean else EXIT_OK
+    return exit_code(report)
+
+
+def exit_code(report: RunReport) -> int:
+    """1 when something needs attention: an error, a document deferred because a service did
+    not answer or refused it, a conflict, or a conflict or orphan found by recovery."""
+    unsettled = any(o.kind in (OutcomeKind.DEFERRED, OutcomeKind.CONFLICT)
+                    for o in report.outcomes)
+    return EXIT_FAILED if unsettled or report.errors or not report.recovery.clean else EXIT_OK
 
 
 def _eval(args: argparse.Namespace) -> int:

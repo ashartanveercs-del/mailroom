@@ -32,6 +32,43 @@ def test_two_attachments_with_the_same_name_get_distinct_keys():
     assert [d.key for d in docs] == ["m1/scan.pdf", "m1/scan.pdf#2"]
 
 
+def keys_of(docs, skipped):
+    return [f"m1/{origin}" for origin, _ in skipped] + [d.key for d in docs]
+
+
+def test_a_name_that_looks_like_a_generated_suffix_still_gets_its_own_key():
+    docs, _ = Expander().documents(message(pdf_att("a.pdf", ["one"]), pdf_att("a.pdf", ["two"]),
+                                           pdf_att("a.pdf#2", ["three"])))
+    assert [d.key for d in docs] == ["m1/a.pdf", "m1/a.pdf#2", "m1/a.pdf#2#2"]
+
+
+def test_a_part_the_mailbox_skipped_never_shares_a_key_with_an_attachment():
+    # the skipped part's outcome is final: a document under the same key would never be filed
+    att = Attachment("big.pdf", "application/pdf", make_pdf([["a small big.pdf"]]))
+    docs, skipped = Expander().documents(message(att, skipped=[("big.pdf", "too_large")]))
+    assert keys_of(docs, skipped) == ["m1/big.pdf", "m1/big.pdf#2"]
+
+
+def test_names_the_mailbox_skipped_are_flattened_like_attachment_names():
+    _, skipped = Expander().documents(message(skipped=[("scans/in/voice.pdf", "too_large")]))
+    assert skipped == [("scans_in_voice.pdf", "too_large")]
+
+
+def test_split_parts_never_share_a_key_with_a_sibling_named_like_a_part():
+    sibling = pdf_att("batch.pdf#p1", ["Invoice No: C-3"])
+    batch = pdf_att("batch.pdf", ["Invoice No: A-1"], ["Invoice No: B-2"])
+    docs, _ = Expander(splitter=SPLITTER).documents(message(sibling, batch))
+    assert [d.key for d in docs] == ["m1/batch.pdf#p1", "m1/batch.pdf#p1#2", "m1/batch.pdf#p2"]
+
+
+def test_a_member_path_never_shares_a_key_with_the_same_path_in_a_nested_archive():
+    inner = make_zip({"x.pdf": make_pdf([["nested"]])})
+    outer = make_zip({"inner.zip/x.pdf": make_pdf([["direct"]]), "inner.zip": inner})
+    docs, skipped = Expander().documents(message(Attachment("o.zip", "application/zip", outer)))
+    keys = keys_of(docs, skipped)
+    assert keys == ["m1/o.zip/inner.zip/x.pdf", "m1/o.zip/inner.zip/x.pdf#2"]
+
+
 def test_zip_members_become_documents():
     zipped = make_zip({"r1.pdf": make_pdf([["Receipt one"]]), "r2.pdf": make_pdf([["Two"]])})
     docs, _ = Expander().documents(message(Attachment("r.zip", "application/zip", zipped)))
@@ -90,6 +127,30 @@ def test_text_comes_from_docx_html_and_plain_text():
     ))
     assert [d.text for d in docs] == ["Service Agreement", "Paid & done", "Receipt café", ""]
     assert [d.kind for d in docs] == ["docx", "html", "text", "image"]
+
+
+DOCX = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+
+def test_the_type_a_document_is_stored_under_comes_from_its_content_not_the_sender():
+    folder, gdoc = "application/vnd.google-apps.folder", "application/vnd.google-apps.document"
+    docs, _ = Expander().documents(message(
+        Attachment("scan.pdf", "image/jpeg", make_pdf([["x"]])),
+        Attachment("photo.png", "application/pdf", make_png(padding=40_000)),
+        Attachment("photo.jpg", gdoc, b"\xff\xd8\xff\xe0" + b"\0" * 40_000),
+        Attachment("c.docx", gdoc, make_docx(["Agreement"])),
+        Attachment("sheet.xlsx", folder, make_zip({"[Content_Types].xml": b"<x/>",
+                                                   "xl/workbook.xml": b"<x/>"})),
+        Attachment("rows.csv", "application/vnd.google-apps.spreadsheet", b"a,b\n1,2\n"),
+        Attachment("notes", "text/plain; charset=utf-8", b"plain words"),
+        Attachment("p.html", folder, b"<html><p>Paid</p></html>"),
+        Attachment("blob.bin", folder, b"\x00\x01binary"),
+        Attachment("locked.zip", folder, make_zip({"a.pdf": b"x"}, encrypt=True)),
+    ))
+    assert [d.mime_type for d in docs] == [
+        "application/pdf", "image/png", "image/jpeg", DOCX, XLSX, "text/csv", "text/plain",
+        "text/html", "application/octet-stream", "application/zip"]
 
 
 def test_html_text_drops_scripts_styles_and_keeps_link_words_only():

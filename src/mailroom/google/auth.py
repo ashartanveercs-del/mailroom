@@ -16,12 +16,13 @@ from dataclasses import replace
 from pathlib import Path
 
 from ..http import Request, Response, Transport
+from ..ports import RunCannotContinue
 from .policy import TOKEN_URI
 
 EXPIRY_SKEW = 60.0  # refresh this many seconds before the token expires
 
 
-class AuthError(Exception):
+class AuthError(RunCannotContinue):
     """The Google connection needs to be set up again (no usable refresh token)."""
 
 

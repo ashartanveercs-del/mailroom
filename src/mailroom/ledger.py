@@ -7,7 +7,9 @@ It holds three things:
     and verified. A crash anywhere leaves a row that recovery can settle.
   * one outcome per document (`documents`), so re-runs and restarts never handle a document
     twice, and duplicates and revisions can be recognised.
-  * which messages are finished (`messages`) and an append-only audit trail (`events`).
+  * which messages are finished (`messages`), how many runs in a row the classifier failed on
+    a document (`attempts`) or a message or a filing failed (`failures`), and an append-only
+    audit trail (`events`).
 
 Every method commits before it returns (autocommit, WAL, synchronous=FULL by default).
 """
@@ -66,6 +68,14 @@ CREATE INDEX IF NOT EXISTS documents_by_sha ON documents (sha256);
 CREATE INDEX IF NOT EXISTS documents_by_identity ON documents (identity);
 
 CREATE TABLE IF NOT EXISTS attempts (key TEXT PRIMARY KEY, count INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS failures (
+    scope      TEXT NOT NULL CHECK (scope IN ('message', 'filing')),
+    key        TEXT NOT NULL,
+    count      INTEGER NOT NULL,
+    last_error TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (scope, key)
+);
 CREATE TABLE IF NOT EXISTS messages (id TEXT PRIMARY KEY, done_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS events (
     seq INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, kind TEXT NOT NULL,
@@ -198,13 +208,23 @@ class Ledger:
         return row["file_id"] if row else None
 
     def adopt_folder(self, folder_id: str, parent_id: str, name: str) -> None:
-        """Record a folder that already existed under a managed folder as managed."""
+        """Record a folder found under a managed folder as managed. A folder the ledger
+        already knows (say, one mailroom made, stopped using when it was trashed, and now
+        finds restored) is taken back under its current place and name."""
         if not self.managed_folder(parent_id):
             raise UnmanagedFolder(parent_id)
-        self.conn.execute(
-            "INSERT OR IGNORE INTO writes (file_id, kind, parent_id, name, status, adopted,"
-            " updated_at) VALUES (?, 'folder', ?, ?, 'done', 1, ?)",
-            (folder_id, parent_id, name, self._now()))
+        try:
+            self.conn.execute(
+                "INSERT INTO writes (file_id, kind, parent_id, name, status, adopted,"
+                " updated_at) VALUES (?, 'folder', ?, ?, 'done', 1, ?)"
+                " ON CONFLICT (file_id) DO UPDATE SET status = 'done', adopted = 1,"
+                " parent_id = excluded.parent_id, name = excluded.name,"
+                " updated_at = excluded.updated_at WHERE kind = 'folder'",
+                (folder_id, parent_id, name, self._now()))
+        except sqlite3.IntegrityError as err:  # another live row holds this name here
+            raise NameTaken(f"{name!r} is already reserved in {parent_id}") from err
+        if not self.managed_folder(folder_id):  # the id is one the ledger knows as a file
+            raise UnmanagedFolder(folder_id)
 
     # -- documents -------------------------------------------------------------------------
 
@@ -264,6 +284,17 @@ class Ledger:
                           " DO UPDATE SET count = count + 1", (key,))
         return self.conn.execute("SELECT count FROM attempts WHERE key = ?",
                                  (key,)).fetchone()["count"]
+
+    def record_failure(self, scope: str, key: str, error: str) -> int:
+        """Count one more failed run for a message or a filing (`scope`) and keep the latest
+        error. Returns the count so far."""
+        self.conn.execute(
+            "INSERT INTO failures (scope, key, count, last_error, updated_at)"
+            " VALUES (?, ?, 1, ?, ?) ON CONFLICT (scope, key) DO UPDATE SET"
+            " count = count + 1, last_error = excluded.last_error,"
+            " updated_at = excluded.updated_at", (scope, key, error, self._now()))
+        return self.conn.execute("SELECT count FROM failures WHERE scope = ? AND key = ?",
+                                 (scope, key)).fetchone()["count"]
 
     # -- messages and audit ----------------------------------------------------------------
 

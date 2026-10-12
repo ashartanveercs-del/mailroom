@@ -13,7 +13,7 @@ from collections.abc import Iterator
 from datetime import UTC, datetime
 from typing import Any
 
-from ..guard import PageCursor
+from ..guard import PageCursor, PageLimitReached
 from ..http import HttpError, Request, Transport
 from ..models import Attachment, Message
 from .policy import GMAIL
@@ -38,6 +38,7 @@ class GmailMailbox:
         self.page_size = page_size
         self.max_attachment_bytes = max_attachment_bytes
         self.max_pages = max_pages
+        self.listing_truncated = False  # did the last listing stop at the page cap?
 
     def _get(self, url: str) -> dict[str, Any]:
         response = self.transport.send(Request("GET", url))
@@ -49,11 +50,16 @@ class GmailMailbox:
         return data
 
     def list_message_ids(self, query: str) -> list[str]:
-        """Message ids matching `query`, oldest first (Gmail lists newest first)."""
+        """Message ids matching `query`, oldest first (Gmail lists newest first).
+
+        A listing longer than `max_pages` pages keeps the newest messages, the ones already
+        read, and sets `listing_truncated` instead of failing: a mailbox too big for the
+        query must not stop every run. A malformed or repeated page token still stops it."""
         cursor = PageCursor(self.max_pages)
         ids: list[str] = []
         seen: set[str] = set()
         token: str | None = None
+        self.listing_truncated = False
         while True:
             params = {"q": query, "maxResults": str(self.page_size)}
             if token:
@@ -64,7 +70,10 @@ class GmailMailbox:
                 if isinstance(mid, str) and mid not in seen:
                     seen.add(mid)
                     ids.append(mid)
-            token = cursor.advance(data.get("nextPageToken"))
+            try:
+                token = cursor.advance(data.get("nextPageToken"))
+            except PageLimitReached:
+                self.listing_truncated, token = True, None
             if token is None:
                 return list(reversed(ids))
 

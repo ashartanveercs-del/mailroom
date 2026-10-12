@@ -74,6 +74,14 @@ def test_bad_configs_fail_at_startup_with_a_clear_message(tmp_path, snippet, mes
         load(tmp_path, snippet)
 
 
+def test_the_owners_own_names_reach_the_decision_policy(tmp_path):
+    s = load(tmp_path, MINIMAL + 'owner_names = ["Larkspur Design Studio", "Larkspur LLC"]\n')
+    assert s.policy().owner_names == ("Larkspur Design Studio", "Larkspur LLC")
+    assert load(tmp_path, MINIMAL).policy().owner_names == ()
+    with pytest.raises(ConfigError, match="owner_names"):
+        load(tmp_path, MINIMAL + 'owner_names = "Larkspur Design Studio"\n')
+
+
 def test_rules_classifier_needs_no_model(tmp_path):
     s = load(tmp_path, '[drive]\nroot_folder_id = "abc"\n[classifier]\nkind = "rules"\n')
     assert s.classifier == "rules"

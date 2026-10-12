@@ -140,6 +140,11 @@ class InMemoryDrive:
         entry = self._files[file_id]
         entry.meta = replace(entry.meta, trashed=True)
 
+    def restore(self, file_id: str) -> None:
+        """Take a file or folder back out of the trash, as its owner can."""
+        entry = self._files[file_id]
+        entry.meta = replace(entry.meta, trashed=False)
+
     def tamper(self, file_id: str, data: bytes) -> None:
         entry = self._files[file_id]
         entry.data = data

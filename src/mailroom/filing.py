@@ -20,10 +20,11 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 
+from .guard import BlockedRequest
 from .ledger import Ledger, WriteRow
 from .ports import AlreadyExists, Drive, DriveError, StoredFile
 
@@ -124,7 +125,8 @@ class Filer:
         else:
             [folder_id] = self.drive.reserve_ids(1)
             row = self.ledger.begin_write(folder_id, "folder", parent, name)
-            with contextlib.suppress(AlreadyExists):  # an earlier attempt landed
+            # AlreadyExists: an earlier attempt landed
+            with self._refusal_rolls_back(row), contextlib.suppress(AlreadyExists):
                 self.drive.create_folder(folder_id, name, parent)
             self._confirm(row)
         self._folders[(parent, name)] = folder_id
@@ -150,9 +152,21 @@ class Filer:
         [file_id] = self.drive.reserve_ids(1)
         row = self.ledger.begin_write(file_id, "file", parent_id, name, doc_key=doc_key,
                                       md5=md5, sha256=sha256, size=len(data))
-        with contextlib.suppress(AlreadyExists):  # a retried request whose first try landed
+        with self._refusal_rolls_back(row), contextlib.suppress(AlreadyExists):
+            # AlreadyExists: a retried request whose first try landed
             self.drive.create_file(file_id, name, parent_id, data, mime_type, description)
         return self._confirm(row)
+
+    @contextlib.contextmanager
+    def _refusal_rolls_back(self, row: WriteRow) -> Iterator[None]:
+        """The allowlist checks a request before it is sent, so a refused create never left
+        the process: its intent can be rolled back now instead of by the next recovery."""
+        try:
+            yield
+        except BlockedRequest:
+            self.ledger.roll_back_write(row.file_id, "refused by the allowlist; never sent")
+            self.ledger.log("write_refused", file_id=row.file_id, doc_key=row.doc_key)
+            raise
 
     def _usable_folder(self, folder_id: str) -> None:
         meta = self.drive.get(folder_id)
@@ -187,11 +201,12 @@ class Filer:
         if self.drive.get(row.file_id) is not None:
             return self._confirm(row)  # it landed: verify and roll forward
         if row.kind == "folder":
-            with contextlib.suppress(AlreadyExists):  # a resent create whose reply was lost
+            # AlreadyExists: a resent create whose reply was lost
+            with self._refusal_rolls_back(row), contextlib.suppress(AlreadyExists):
                 self.drive.create_folder(row.file_id, row.name, row.parent_id)
             return self._confirm(row)
         if data is not None and hashlib.sha256(data).hexdigest() == row.sha256:
-            with contextlib.suppress(AlreadyExists):
+            with self._refusal_rolls_back(row), contextlib.suppress(AlreadyExists):
                 self.drive.create_file(row.file_id, row.name, row.parent_id, data, mime_type,
                                        description)
             return self._confirm(row)  # resumed with the same id

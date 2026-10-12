@@ -58,6 +58,27 @@ def test_adopted_folders_are_managed(ledger):
         ledger.adopt_folder("d10", "not-managed", "X")
 
 
+def test_a_folder_rolled_back_and_then_found_again_is_managed_again(ledger):
+    ledger.begin_write("d1", "folder", ROOT, "Invoices")
+    ledger.finish_write("d1")
+    ledger.roll_back_write("d1", "folder trashed by someone else")
+    assert not ledger.managed_folder("d1")
+    ledger.adopt_folder("d1", ROOT, "Invoices")          # restored from the trash
+    assert ledger.managed_folder("d1")
+    assert ledger.folder_for(ROOT, "Invoices") == "d1"
+    ledger.begin_write("f1", "file", "d1", "a.pdf")      # and can be filed into
+
+
+def test_adopting_never_fails_silently(ledger):
+    ledger.begin_write("d1", "folder", ROOT, "Invoices")
+    ledger.mark_conflict("d1", "the stored copy is in the trash")
+    with pytest.raises(NameTaken):                       # the conflict still holds the name
+        ledger.adopt_folder("d2", ROOT, "Invoices")
+    ledger.begin_write("f1", "file", ROOT, "a.pdf")
+    with pytest.raises(UnmanagedFolder):                 # an id the ledger knows as a file
+        ledger.adopt_folder("f1", ROOT, "a.pdf")
+
+
 def test_write_for_doc_returns_the_live_attempt(ledger):
     ledger.begin_write("f1", "file", ROOT, "a.pdf", doc_key="k")
     ledger.roll_back_write("f1", "never landed")

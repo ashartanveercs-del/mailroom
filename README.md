@@ -31,10 +31,11 @@ requests the allowlist let through, by rule:
 |---|---|
 | **Read-only intake, enforced on the wire** | Every outbound request (Gmail, Drive, OAuth, the model) is matched against an explicit allowlist of method, host, path pattern, query keys and, for writes, the request body, *before* it is sent. Gmail has three read endpoints in that table and nothing else. Next-page tokens are re-validated and spliced into mailroom's own URL; a URL the server returns is never requested. |
 | **Write-ahead, hash-verified filing** | A file id is reserved and a ledger row (folder, name, md5, sha256, size) is committed before every upload. A document counts as filed only after the stored copy is read back and matches. After a crash, recovery rolls forward, resumes or rolls back each unfinished filing. Nothing can update, move or delete a file, so nothing is ever overwritten. |
-| **Containers and batch scans** | File types are decided by content. Zips and attached emails are opened (with zip-bomb, encryption and depth limits) and their files filed separately. PDFs holding several documents are split by a pluggable splitter, but only when the cut points are certain. |
-| **Classification that has to show its work** | A pluggable LLM/vision classifier proposes a type and fields. They are used only if confidence clears the type's threshold, an independent rule classifier doesn't disagree, and every value that goes into a folder or file name appears in the document's own text. |
-| **An offline gate with zero tolerance** | 3 synthetic corpora (47 documents) x 3 transports x 3 modes (live, preview, a crash at every write) run with fakes for every external service. One misfile fails CI. |
-| **Tested without an account** | 367 tests, about 20 s, no network, no keys. The real Gmail/Drive adapters, allowlist, retries and OAuth run against an in-process simulation of the Google REST APIs. |
+| **Containers and batch scans** | File types, and the type a file is stored under, are decided by content, never by the sender. Zips and attached emails are opened (with zip-bomb, encryption and depth limits) and their files filed separately. PDFs holding several documents are split by a pluggable splitter, but only when the cut points are certain. |
+| **Classification that has to show its work** | A pluggable LLM/vision classifier proposes a type and fields. They are used only if confidence clears the type's threshold, an independent rule classifier doesn't disagree, and every value that goes into a folder or file name appears in the document's own text, in the role its field needs: not the bill-to party as the vendor, not the due date as the date. |
+| **One bad message never stops the queue** | A failure counts against the one document or message it happened in. Drive not answering is retried every run and reported; a refusal, or a message that keeps failing, becomes a conflict for a person after 3 runs. Only a failure that is no one message's (refused credentials, a mailbox that cannot be listed) stops a run. |
+| **An offline gate with zero tolerance** | 3 synthetic corpora (54 documents) x 3 transports x 3 modes (live, preview, a crash at every write) run with fakes for every external service. One misfile fails CI. |
+| **Tested without an account** | 426 tests, about 20 s, no network, no keys. The real Gmail/Drive adapters, allowlist, retries and OAuth run against an in-process simulation of the Google REST APIs. |
 
 ## Architecture
 
@@ -45,7 +46,7 @@ flowchart LR
     EX --> DUP{same bytes<br/>seen before?}
     DUP -- yes --> D1[duplicate]
     DUP -- no --> LLM[LLM / vision<br/>classifier]
-    LLM --> DEC["decision<br/>threshold, cross-check,<br/>grounding, revision check"]
+    LLM --> DEC["decision<br/>threshold, cross-check,<br/>grounding, roles, revision check"]
     RULES[rule classifier] --> DEC
     DEC -- certain --> PLAN[plan in ledger]
     DEC -- anything else --> REV[review folder + reason]
@@ -62,7 +63,7 @@ Every request from every adapter goes through the same layers
 GmailMailbox / GoogleDrive
   -> AuthorizedTransport   bearer token; one refresh and one retry on a 401
   -> RetryingTransport     backoff on 429/5xx; network errors retried only for idempotent requests
-  -> GuardedTransport      the allowlist (guard.py + google/policy.py); BlockedRequest stops the run
+  -> GuardedTransport      the allowlist (guard.py + google/policy.py); a refused request is never sent
   -> wire                  urllib in production (redirects are not followed), simulators in tests
 ```
 
@@ -91,14 +92,18 @@ Many HTTP APIs honour `X-HTTP-Method-Override`, which would let an allowlisted P
 PATCH or DELETE. Write rules inspect the body
 ([`google/policy.py`](src/mailroom/google/policy.py)). An upload must be a well-formed two-part
 multipart body whose metadata carries a reserved id, exactly one parent, a parent mailroom
-manages, no keys beyond `id/name/mimeType/parents/description`, and is not a folder. A Drive
-listing query must match the one grammar the adapter builds, so a vendor named
-`x' or name contains '` is escaped into a literal and cannot widen the search. Page tokens get
-the same treatment: they are checked against an opaque-token charset, a repeat is refused (it
-would loop forever), pages are capped, and the token goes into mailroom's own URL. A token that
-is really `https://attacker.example.com/...` stops the listing; nothing is fetched from it. The
-attachment's MIME type comes from the sender, so it is reduced to `type/subtype` before it goes
-into a multipart header.
+manages, no keys beyond `id/name/mimeType/parents/description`, and a plain content type: not a
+folder, and not any other of Drive's own types, which would make Drive convert the file instead
+of storing its bytes. A Drive listing query must match the one grammar the adapter builds, so a
+vendor named `x' or name contains '` is escaped into a literal and cannot widen the search. Page
+tokens get the same treatment: they are checked against an opaque-token charset, a repeat is
+refused (it would loop forever), pages are capped, and the token goes into mailroom's own URL. A
+token that is really `https://attacker.example.com/...` stops the listing; nothing is fetched
+from it. A mailbox listing that reaches the page cap keeps the newest messages and says so,
+rather than stopping every run. The attachment's MIME type comes from the sender, so it is never
+passed on: the type a file is stored under comes from its bytes, like its kind does. (An
+attachment that calls itself a Drive folder used to stop every run; the containers corpus keeps
+one.)
 
 **2. Retrying a create is only safe if the create is idempotent.** If an upload's response is
 lost, the client cannot tell whether the file landed. Mailroom reserves the id first
@@ -131,6 +136,12 @@ invoice at 0.95. [`routing.decide`](src/mailroom/routing.py) also requires:
   text, as whole words: `INV-204` is not grounded by `INV-2041`. Dates are read in the
   configured order only, because guessing between 03/04 and 04/03 is exactly how a document
   lands in the wrong month.
+- **Roles**: the most common real extraction error is a value from the right document in the
+  wrong field, and grounding cannot see it. So a value must also appear somewhere other than
+  right after a label for another role (on its line, or on the line above it): a vendor found
+  only after "Bill to", "Ship to" or "Customer" is the party billed or shipped to, and a date
+  found only after "Due", "Valid until" or "Expires" is a deadline, not the date of the
+  document. A vendor is never one of the owner's own names (`classifier.owner_names`).
 - **Images**: a photo has no text of its own, so its fields are grounded in the model's
   transcript, the bar is higher (0.95), and the label must agree with what the model itself read.
 - **Revisions**: a document with the same type, issuer and number as one already filed, but
@@ -146,11 +157,31 @@ limits are checked on the declared sizes and again while reading, because declar
 attacker-controlled. Encrypted, corrupt, over-limit or too-deeply nested containers are filed
 whole for review, never dropped. The container itself is never filed: its files are.
 
+Word text comes from one forward scan of the paragraph and text tags: no XML parser (no entity
+expansion), and no backtracking pattern. One like `<w:p>.*?</w:p>` rescans to the end of the
+file from every paragraph left open, so its cost grows with the square of the size: 30,000 open
+paragraphs (2 KB zipped) took it almost two minutes on a laptop, and take about a tenth of a
+second now. Every document and skipped part gets a key unique within its message: a name that
+mimics another one's key (`a.pdf`, `a.pdf`, `a.pdf#2`) gets a suffix of its own instead of
+inheriting that one's outcome and never being filed.
+
 **7. A wrong cut is worse than no cut.** The default splitter
 ([`split.py`](src/mailroom/split.py)) starts a new document where a new document number or
 "Page 1 of N" appears, and only cuts when every part starts with a number and every page has
 text. Otherwise the file goes to review as `possible_multiple_documents`. Splitters are
 pluggable ([`examples/custom_splitter.py`](examples/custom_splitter.py)).
+
+**8. One bad message must not stop the queue.** Messages are taken oldest first, so a run that
+stopped at a message that keeps failing would stop at the same message every time, and nothing
+behind it would ever be filed. [`pipeline.py`](src/mailroom/pipeline.py) charges every failure
+to the document or message it happened in. If Drive does not answer (network, throttling, a
+5xx), the document keeps its plan and is retried every run, and every run reports it (exit 1).
+If the filing is refused (a 4xx, a full drive, a request the allowlist refused before sending
+it), it is retried, then becomes a conflict for a person after 3 runs. A plug-in classifier that
+crashes counts as a classifier failure. Anything else that goes wrong with a message is retried
+and set aside as a conflict after 3 runs. Only a failure that is no one message's stops a run:
+refused credentials, a mailbox that cannot be listed, a drive that recovery cannot reach, or a
+broken ledger.
 
 ## The evaluation gate
 
@@ -158,7 +189,7 @@ pluggable ([`examples/custom_splitter.py`](examples/custom_splitter.py)).
 
 | | |
 |---|---|
-| **corpora** | `everyday` (11 documents): invoices, receipts, a contract, a phone photo, an HTML receipt, an unwanted catalogue, name collisions with the owner's own files, sent and spam mail that must not be taken in. `containers` (17): zips, forwarded emails, a 4-page batch scan of 3 invoices, an unsure batch, an encrypted zip, a zip bomb, nesting past the limit, a locked PDF, a signature file. `adversarial` (19): a model that is confidently wrong on a look-alike quote, hallucinates a number, a vendor and a date, mislabels a receipt, obeys a prompt injection, returns garbage, is down, and is over-confident on a blurry photo; plus a re-sent and a corrected invoice and a path-traversal vendor name. |
+| **corpora** | `everyday` (11 documents): invoices, receipts, a contract, a phone photo, an HTML receipt, an unwanted catalogue, name collisions with the owner's own files, sent and spam mail that must not be taken in. `containers` (21): zips, forwarded emails, a 4-page batch scan of 3 invoices, an unsure batch, an encrypted zip, a zip bomb, nesting past the limit, a locked PDF, a signature file, a PDF whose sender calls it a Drive folder, and three attachments named `scan.pdf`, `scan.pdf`, `scan.pdf#2`. `adversarial` (22): a model that is confidently wrong on a look-alike quote, hallucinates a number, a vendor and a date, mislabels a receipt, obeys a prompt injection, returns garbage, is down, is over-confident on a blurry photo, and picks real values in the wrong role (the due date as the date, the ship-to party or the owner's own name as the vendor); plus a re-sent and a corrected invoice and a path-traversal vendor name. |
 | **transports** | `memory` (in-memory fakes behind the ports); `http` (the production Gmail/Drive adapters, allowlist, retries and OAuth against the simulated Google REST API); `http-faults` (the same with 503s and lost responses injected) |
 | **modes** | `live` (run until nothing is deferred, then score every document); `preview` (must write nothing, change no state, and agree with a live run); `crash` (kill the process before *and* after every write that lands, restart, finish; the result must be identical to an uninterrupted run) |
 
@@ -172,10 +203,10 @@ changed. A cell passes only with zero of each.
 ```text
 $ mailroom eval
 corpus       transport    mode      docs  filed  review  crashes  misfiles  other   secs  result
-everyday     memory       live        11      9       1        0         0      0   0.03  PASS
+everyday     memory       live        11      9       1        0         0      0   0.02  PASS
 ...
-adversarial  http-faults  crash       19      3      14       53         0      0   1.71  PASS
-27 cells, 416 crash points, 0 misfiles, 0 mismatches, 0 violations: GATE PASSED
+adversarial  http-faults  crash       22      3      17       60         0      0   2.77  PASS
+27 cells, 461 crash points, 0 misfiles, 0 mismatches, 0 violations: GATE PASSED
 ```
 
 Two checks keep the gate honest. The scorer is tested on its own: it must flag a wrong path, a
@@ -216,8 +247,10 @@ To file a real mailbox:
 4. `mailroom run --config mailroom.toml --env-file .env --preview` shows what would happen and
    writes nothing. Then drop `--preview`, and schedule it (cron, a systemd timer).
 
-Exit codes: `0` done, `1` something needs attention (conflicts, unreachable services),
-`2` configuration or credentials, `3` a request was refused by the allowlist.
+Exit codes: `0` done, `1` something needs attention (an error, a document deferred because a
+service did not answer or refused it, a conflict), `2` configuration or credentials, `3` the
+mailbox listing was refused by the allowlist (a refused request for one document or message
+counts against that one instead).
 
 ### Plug in your own pieces
 
@@ -250,6 +283,7 @@ keys are errors, so a typo fails at startup.
 | `classifier.date_order` | `MDY` | how to read `03/04/2026`: `MDY` or `DMY` |
 | `classifier.vision_min_confidence` | `0.95` | the bar for documents with no text of their own |
 | `classifier.vendors` | `[]` | names the rule classifier may recognise |
+| `classifier.owner_names` | `[]` | your own business's names: a vendor that is one of them goes to review |
 | `classifier.max_attempts` | `3` | classifier failures before a document goes to review |
 | `ledger.path` | `mailroom.db` | the SQLite ledger: write-ahead log, outcomes, audit events |
 | `split.enabled` | `true` | split batch-scanned PDFs |
@@ -258,15 +292,15 @@ keys are errors, so a typo fails at startup.
 ## Testing
 
 ```bash
-pytest                         # 367 tests, about 20 s, offline, no keys
+pytest                         # 426 tests, about 20 s, offline, no keys
 ruff check src tests examples
 mailroom eval                  # the gate (also a separate CI step that uploads a JSON report)
 ```
 
 Every external service is faked: the mailbox and drive behind the ports
 ([`sim/memory.py`](src/mailroom/sim/memory.py)), the Gmail and Drive REST APIs at the HTTP level
-with real wire formats, 409s, 404s, expiring tokens and injected faults
-([`sim/google_api.py`](src/mailroom/sim/google_api.py)), and the model as a scripted
+with real wire formats, 409s, 404s, expiring tokens, attachment ids as long as Gmail's and
+injected faults ([`sim/google_api.py`](src/mailroom/sim/google_api.py)), and the model as a scripted
 OpenAI-compatible endpoint ([`sim/model.py`](src/mailroom/sim/model.py)). Crashes are injected
 as a `BaseException`, so no `except Exception` in the code under test can swallow one, just as no
 handler runs when a real process is killed. CI runs lint, the tests and the gate on Python 3.11,
@@ -291,7 +325,9 @@ handler runs when a real process is killed. CI runs lint, the tests and the gate
   can at most steer itself into the review folder or a folder its own text supports, inside the
   filing root. It cannot make mailroom send, delete, overwrite or write anywhere else. The
   adversarial corpus includes an injection attempt.
-- **`allowed_senders` is a filter, not authentication.** A From header can be forged.
+- **`allowed_senders` is a filter, not authentication.** A From header can be forged. That is
+  why the type a file is stored under comes from its bytes, never from what the sender
+  declared.
 - **Protect the ledger.** It holds file names, hashes and folder ids (no document contents).
 - **Run one instance at a time** (for example cron with `flock`): there is no cross-process lock
   yet.
@@ -303,6 +339,10 @@ handler runs when a real process is killed. CI runs lint, the tests and the gate
   usually end up in review.
 - Uploads are single-request multipart, so documents over 5 MB are skipped and reported.
 - The email body itself is not filed; only what is attached.
+- The role labels ("Bill to", "Due date"...) are English, like the default document types. A
+  role check only catches a value whose label sits right before it or on the line above.
+- The Gmail listing is capped at 200 pages of 100 messages; a longer one keeps the newest
+  messages and says so on every run. Narrow `mailbox.query` (e.g. `newer_than:30d`) to fit.
 
 ## Roadmap
 

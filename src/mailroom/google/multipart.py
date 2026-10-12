@@ -11,12 +11,21 @@ from typing import Any
 _MIME = re.compile(r"[a-z0-9][a-z0-9.+-]*/[a-z0-9][a-z0-9.+-]*")
 _BOUNDARY = re.compile(r"multipart/related;\s*boundary=\"?([A-Za-z0-9'()+_,\-./:=?]{1,70})\"?",
                        re.IGNORECASE)
+GOOGLE_TYPES = "application/vnd.google-apps."  # Drive's own types: folders, Docs, Sheets...
+
+
+def is_google_type(mime: str) -> bool:
+    return (mime or "").strip().lower().startswith(GOOGLE_TYPES)
 
 
 def safe_mime(mime: str) -> str:
-    """The sender chose this value: anything but a plain type/subtype becomes octet-stream."""
+    """A type that is safe to put in an upload: a plain type/subtype that is not one of
+    Drive's own types (those make Drive convert the upload, or create a folder). Anything
+    else becomes octet-stream."""
     mime = (mime or "").strip().lower()
-    return mime if _MIME.fullmatch(mime) else "application/octet-stream"
+    if not _MIME.fullmatch(mime) or is_google_type(mime):
+        return "application/octet-stream"
+    return mime
 
 
 def build_related(metadata: Mapping[str, Any], data: bytes, mime: str) -> tuple[bytes, str]:

@@ -13,9 +13,17 @@ from typing import Protocol
 from .models import Message
 
 
+class RunCannotContinue(Exception):
+    """Nothing else in this run can succeed either: the account's credentials were refused,
+    say. Raised from anywhere, it stops the run, instead of being charged to one message or
+    document the way every other failure is."""
+
+
 class Mailbox(Protocol):
     def list_message_ids(self, query: str) -> list[str]:
-        """Ids of messages matching `query`, oldest first."""
+        """Ids of messages matching `query`, oldest first. An adapter that cuts a very long
+        listing short keeps the newest messages and sets a `listing_truncated` attribute,
+        which the run reports."""
         ...
 
     def get_message(self, message_id: str) -> Message: ...

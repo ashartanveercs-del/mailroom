@@ -31,6 +31,7 @@ grounding = true                # every value used in a folder or file name must
 date_order = "MDY"              # how to read 03/04/2026: "MDY" or "DMY"
 vision_min_confidence = 0.95    # the bar for documents with no text of their own
 vendors = []                    # names the rule classifier may recognise
+owner_names = []                # your own business's names: never accepted as the vendor
 max_attempts = 3                # classifier failures before a document goes to review
 
 [ledger]

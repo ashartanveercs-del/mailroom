@@ -140,6 +140,86 @@ def test_a_value_that_would_make_an_unsafe_name_goes_to_review():
         review("ungrounded_title"))
 
 
+# --- roles: the right value for the right field -----------------------------------------
+
+ROLES = """Blue Fern Hosting
+INVOICE  Invoice No: BF-2041
+Invoice date: 12/28/2025
+Bill to: Acme Design Studio
+Due date: 01/27/2026
+Amount due: $120.00"""
+
+
+def test_the_customer_and_the_due_date_are_not_the_vendor_and_the_date():
+    # every value is in the text, so plain grounding passes: it is the role that is wrong
+    swapped = verdict(vendor="Acme Design Studio", date="2026-01-27")
+    assert as_tuple(decide(doc(ROLES), swapped, RuleOpinion("invoice"), POLICY)) == review(
+        "wrong_role_date")
+    customer = verdict(vendor="Acme Design Studio", date="2025-12-28")
+    assert as_tuple(decide(doc(ROLES), customer, RuleOpinion("invoice"), POLICY)) == review(
+        "wrong_role_vendor")
+    right = decide(doc(ROLES), verdict(date="2025-12-28"), RuleOpinion("invoice"), POLICY)
+    assert as_tuple(right) == (("Invoices", "2025", "Blue Fern Hosting"),
+                               "2025-12-28 Blue Fern Hosting BF-2041.pdf", False, "")
+
+
+@pytest.mark.parametrize("text", [
+    "Blue Fern Hosting\nInvoice No: BF-2041\nInvoice date: 12/28/2025\nBILL TO\n"
+    "Acme Design Studio\n1 Example Road",                     # the label on the line above
+    "Blue Fern Hosting  Invoice No: BF-2041  Invoice date: 12/28/2025  "
+    "Ship to: Acme Design Studio",                            # two columns read as one line
+    "Blue Fern Hosting\nInvoice No: BF-2041 Invoice date: 12/28/2025\n"
+    "Customer - Acme Design Studio",
+])
+def test_a_vendor_found_only_where_the_document_names_its_customer_is_refused(text):
+    dest = decide(doc(text), verdict(vendor="Acme Design Studio", date="2025-12-28"), None,
+                  POLICY)
+    assert as_tuple(dest) == review("wrong_role_vendor")
+
+
+@pytest.mark.parametrize("line", ["Payment due by 01/27/2026", "Pay by: January 27, 2026",
+                                  "Valid until 01/27/2026", "Expires on 27 January 2026"])
+def test_a_date_found_only_as_a_deadline_is_refused(line):
+    text = f"Blue Fern Hosting\nInvoice No: BF-2041\nIssued 12/28/2025\n{line}"
+    dest = decide(doc(text), verdict(date="2026-01-27"), None, POLICY)
+    assert as_tuple(dest) == review("wrong_role_date")
+
+
+@pytest.mark.parametrize("text", [
+    "Inkwell & Co. Printing\nRECEIPT\nPayment date: 01/27/2026\nInvoice No: BF-2041",
+    "Client: Acme Design Studio\nProvider: Blue Fern Hosting\nInvoice No: BF-2041\n"
+    "Signed on 01/27/2026",
+])
+def test_labels_that_can_name_the_fields_own_role_do_not_count(text):
+    # a receipt's payment date is its date; a contract's client is its other party
+    vendor = "Acme Design Studio" if "Client" in text else "Inkwell & Co. Printing"
+    dest = decide(doc(text), verdict(vendor=vendor, date="2026-01-27"), None, POLICY)
+    assert not dest.review, dest.reason
+
+
+def test_a_value_that_also_appears_in_its_own_role_is_fine():
+    text = ("Blue Fern Hosting\nInvoice No: BF-2041\nInvoice date: 01/27/2026\n"
+            "Due date: 01/27/2026 (due on receipt)\nBill to: Acme Design Studio")
+    assert not decide(doc(text), verdict(date="2026-01-27"), None, POLICY).review
+
+
+def test_your_own_name_is_never_the_vendor():
+    own = Policy(types=POLICY.types, owner_names=("Acme Design Studio",))
+    text = ROLES + "\nThank you, Acme Design Studio, for your business"
+    for vendor in ("Acme Design Studio", "Acme Design Studio LLC", "ACME DESIGN STUDIO"):
+        dest = decide(doc(text + f"\n{vendor}"), verdict(vendor=vendor, date="2025-12-28"),
+                      None, own)
+        assert as_tuple(dest) == review("vendor_is_owner")
+    assert not decide(doc(ROLES), verdict(date="2025-12-28"), None, own).review
+
+
+def test_role_checks_are_part_of_grounding():
+    loose = Policy(types=POLICY.types, grounding=False)
+    dest = decide(doc(ROLES), verdict(vendor="Acme Design Studio", date="2026-01-27"), None,
+                  loose)
+    assert not dest.review and dest.folder == ("Invoices", "2026", "Acme Design Studio")
+
+
 def test_review_names_keep_the_original_file_name():
     dest = decide(doc(filename="weird:name?.pdf"), verdict(confidence=0.1), None, POLICY)
     assert dest.name == "weird-name-.pdf"

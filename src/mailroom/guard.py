@@ -34,6 +34,11 @@ class UnsafePageToken(BlockedRequest):
     """A next-page token that is not an opaque token, repeats, or runs past the page cap."""
 
 
+class PageLimitReached(UnsafePageToken):
+    """The listing ran past the page cap. A caller that can work with a partial listing (the
+    newest messages of a huge mailbox) catches this one; any other bad token still stops."""
+
+
 @dataclass(frozen=True)
 class Rule:
     name: str
@@ -176,6 +181,6 @@ class PageCursor:
         if token in self._seen:
             raise UnsafePageToken("the next-page token repeated an earlier page")
         if self.pages >= self.max_pages:
-            raise UnsafePageToken(f"the listing ran to more than {self.max_pages} pages")
+            raise PageLimitReached(f"the listing ran to more than {self.max_pages} pages")
         self._seen.add(token)
         return token

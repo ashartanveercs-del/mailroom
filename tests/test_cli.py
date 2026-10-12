@@ -1,6 +1,25 @@
 import json
 
-from mailroom.__main__ import main
+import pytest
+
+from mailroom.__main__ import exit_code, main
+from mailroom.filing import Recovery
+from mailroom.models import Outcome, OutcomeKind
+from mailroom.pipeline import RunReport
+
+
+@pytest.mark.parametrize("kinds,errors,recovery,code", [
+    (["filed", "review", "duplicate", "skipped"], [], Recovery(), 0),
+    (["filed", "deferred"], [], Recovery(), 1),       # a service did not answer: not done yet
+    (["filed", "conflict"], [], Recovery(), 1),
+    (["filed"], ["m1: HTTP 503"], Recovery(), 1),
+    (["filed"], [], Recovery(conflicts=["f1"]), 1),
+])
+def test_the_exit_code_says_when_something_needs_attention(kinds, errors, recovery, code):
+    outcomes = [Outcome(key=f"m1/{n}.pdf", message_id="m1", origin=f"{n}.pdf",
+                        kind=OutcomeKind(kind)) for n, kind in enumerate(kinds)]
+    report = RunReport(preview=False, recovery=recovery, outcomes=outcomes, errors=errors)
+    assert exit_code(report) == code
 
 
 def test_allowlist_lists_every_request_mailroom_may_make(capsys):

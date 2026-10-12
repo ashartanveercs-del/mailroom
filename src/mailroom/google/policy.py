@@ -8,7 +8,9 @@ Drive: reserve ids, read a file's metadata, list a folder's children by exact na
 must have the one shape the adapter builds), create a folder, and upload a new file. There is
 no update, move, copy, permission or delete endpoint, so an existing file can never be
 changed. Creates must carry a reserved id (which is what makes retries safe) and exactly one
-parent that mailroom manages (the configured root or a folder it made or adopted there).
+parent that mailroom manages (the configured root or a folder it made or adopted there). An
+upload must name a plain content type: not a folder, and not any other of Drive's own types,
+which would make Drive convert the file instead of storing its bytes.
 """
 
 from __future__ import annotations
@@ -21,7 +23,7 @@ from collections.abc import Callable
 from ..guard import Allowlist, BlockedRequest, Rule
 from ..http import Request
 from ..ports import FOLDER_MIME
-from .multipart import parse_related
+from .multipart import is_google_type, parse_related
 
 GMAIL = "https://gmail.googleapis.com/gmail/v1/users/me"
 DRIVE = "https://www.googleapis.com/drive/v3"
@@ -29,6 +31,8 @@ UPLOAD = "https://www.googleapis.com/upload/drive/v3/files"
 TOKEN_URI = "https://oauth2.googleapis.com/token"
 
 ID = r"[A-Za-z0-9_-]{1,256}"
+# Gmail attachment ids are opaque URL-safe base64 several hundred characters long
+ATTACHMENT_ID = r"[A-Za-z0-9_-]{1,2048}"
 TOKEN = r"[A-Za-z0-9_\-.~!=+/]{1,2048}"
 FIELDS = r"[A-Za-z0-9_,()/]{1,512}"
 SMALL_NUMBER = r"[1-9][0-9]{0,2}"
@@ -68,11 +72,15 @@ def _check_metadata(meta: object, managed: Callable[[str], bool], *, folder: boo
         raise BlockedRequest("a create needs exactly one parent")
     if not managed(parents[0]):
         raise BlockedRequest("the parent folder is not managed by mailroom")
-    is_folder = meta.get("mimeType") == FOLDER_MIME
+    mime = meta.get("mimeType")
+    is_folder = mime == FOLDER_MIME
     if folder and not is_folder:
         raise BlockedRequest("only folders can be created without content")
     if not folder and is_folder:
         raise BlockedRequest("an upload cannot create a folder")
+    if not folder and (not isinstance(mime, str) or is_google_type(mime)):
+        raise BlockedRequest("an upload must name a plain type, not a Google type that "
+                             "makes Drive convert it")
     if not isinstance(meta.get("description", ""), str):
         raise BlockedRequest("description must be text")
 
@@ -128,7 +136,7 @@ def google_allowlist(managed_folder: Callable[[str], bool]) -> Allowlist:
         Rule("gmail.messages.get", "GET", gmail, rf"/gmail/v1/users/me/messages/{ID}",
              required={"format": "full"}),
         Rule("gmail.attachments.get", "GET", gmail,
-             rf"/gmail/v1/users/me/messages/{ID}/attachments/{ID}"),
+             rf"/gmail/v1/users/me/messages/{ID}/attachments/{ATTACHMENT_ID}"),
         Rule("drive.files.generateIds", "GET", drive, r"/drive/v3/files/generateIds",
              query={"count"}, required={"space": "drive", "type": "files"},
              validators={"count": r"[1-9][0-9]?"}),

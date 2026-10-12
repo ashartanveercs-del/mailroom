@@ -25,8 +25,8 @@ def _make(year: int, month: int, day: int) -> date | None:
         return None
 
 
-def find_dates(text: str, order: str = "MDY") -> list[date]:
-    """Calendar dates written in `text`, in order of appearance, without repeats.
+def date_spans(text: str, order: str = "MDY") -> list[tuple[int, date]]:
+    """Every calendar date written in `text` with the offset it starts at, in order.
 
     Numeric dates like 03/04/2026 are read in the configured `order` only ("MDY" or "DMY"):
     guessing between the two is exactly how a document ends up in the wrong month."""
@@ -41,9 +41,15 @@ def find_dates(text: str, order: str = "MDY") -> list[date]:
         found.append((m.start(), _make(int(m[3]), _MONTHS[m[1][:3].lower()], int(m[2]))))
     for m in _DAY_FIRST.finditer(text):
         found.append((m.start(), _make(int(m[3]), _MONTHS[m[2][:3].lower()], int(m[1]))))
+    return [(start, value) for start, value in sorted(found, key=lambda pair: pair[0])
+            if value is not None]
+
+
+def find_dates(text: str, order: str = "MDY") -> list[date]:
+    """Calendar dates written in `text`, in order of appearance, without repeats."""
     out: list[date] = []
-    for _, value in sorted(found, key=lambda pair: pair[0]):
-        if value is not None and value not in out:
+    for _, value in date_spans(text, order):
+        if value not in out:
             out.append(value)
     return out
 

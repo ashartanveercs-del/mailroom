@@ -2,11 +2,15 @@ import hashlib
 
 import pytest
 
-from mailroom.http import TransportError
+from mailroom.documents import Expander
+from mailroom.google.auth import AuthError
+from mailroom.guard import BlockedRequest
+from mailroom.http import HttpError, TransportError
 from mailroom.models import Attachment, OutcomeKind
+from mailroom.ports import DriveError
 from mailroom.sim.faults import CrashPlan, SimulatedCrash
 from mailroom.sim.files import make_png, make_zip
-from mailroom.sim.memory import InMemoryDrive
+from mailroom.sim.memory import InMemoryDrive, InMemoryMailbox
 from mailroom.sim.model import Scripted, SimulatedModel
 from tests.support import msg, pdf
 
@@ -218,6 +222,162 @@ def test_a_drive_outage_defers_the_document_and_keeps_its_decision(world_factory
     assert w.ledger.planned("m1/a.pdf") is not None and not w.ledger.message_done("m1")
     assert kinds(w.mailroom.run()) == [("a.pdf", "filed", "")]
     assert w.drive.tree() == {INVOICE_PATH: md5(BLUE_FERN)}
+
+
+def test_no_document_is_lost_to_a_name_that_looks_like_a_generated_key(world_factory):
+    w = world_factory([msg("m1", ("a.pdf", pdf("first document")),
+                           ("a.pdf", pdf("second document")),
+                           ("a.pdf#2", pdf("Totally different third document")))], SCRIPT)
+    report = w.mailroom.run()
+    assert len({o.key for o in report.outcomes}) == 3
+    assert sorted(w.drive.tree()) == ["Needs review/a.pdf", "Needs review/a_2.pdf",
+                                      "Needs review/a_3.pdf"]
+    assert w.ledger.message_done("m1")
+
+
+# --- one bad message or document never holds up the rest ----------------------------------
+
+class CrashingClassifier:
+    """The real classifier, except that it blows up on one document, as a buggy plug-in
+    classifier would."""
+
+    def __init__(self, inner, needle):
+        self.inner, self.needle = inner, needle
+
+    def classify(self, doc):
+        if self.needle in doc.text:
+            raise KeyError("fields")
+        return self.inner.classify(doc)
+
+
+def test_a_classifier_that_crashes_on_one_document_does_not_hold_up_the_rest(world_factory):
+    w = world_factory([msg("m1", ("a.pdf", BLUE_FERN)), msg("m2", ("r.pdf", RECEIPT), minutes=1)],
+                      SCRIPT)
+    w.mailroom.classifier = CrashingClassifier(w.mailroom.classifier, "BF-2041")
+    report = w.mailroom.run()
+    assert kinds(report) == [("a.pdf", "deferred", "classifier_unavailable"),
+                             ("r.pdf", "filed", "")]
+    assert any("m1/a.pdf" in e and "KeyError" in e for e in report.errors)
+    w.mailroom.run()
+    assert kinds(w.mailroom.run()) == [("a.pdf", "review", "classifier_unavailable")]
+
+
+class BrokenSplitter:
+    def plan(self, page_texts):
+        raise RuntimeError("splitter bug")
+
+
+def test_a_message_that_keeps_failing_is_set_aside_and_never_holds_up_later_mail(world_factory):
+    w = world_factory([msg("m1", ("batch.pdf", pdf(INVOICE_TEXT, "page two"))),
+                       msg("m2", ("r.pdf", RECEIPT), minutes=1)], SCRIPT)
+    w.mailroom.expander = Expander(splitter=BrokenSplitter())
+    first = w.mailroom.run()
+    assert kinds(first) == [("r.pdf", "filed", "")]
+    [error] = first.errors
+    assert error.startswith("m1:") and "splitter bug" in error
+    assert not w.ledger.message_done("m1")
+    w.mailroom.run()
+    [aside] = w.mailroom.run().outcomes                  # the third failure in a row
+    assert (aside.key, aside.kind) == ("m1", OutcomeKind.CONFLICT)
+    assert "splitter bug" in aside.reason
+    assert w.ledger.message_done("m1") and w.mailroom.run().outcomes == []
+
+
+class RefusingDrive(InMemoryDrive):
+    """The allowlist refuses one document's upload, as it would a request a bug built."""
+
+    def __init__(self, refused):
+        super().__init__("root")
+        self.refused = refused
+
+    def create_file(self, file_id, name, *args, **kwargs):
+        if self.refused in name:
+            raise BlockedRequest("an upload cannot do that")
+        return super().create_file(file_id, name, *args, **kwargs)
+
+
+def test_a_refused_upload_holds_up_only_its_own_document(world_factory):
+    w = world_factory([msg("m1", ("a.pdf", BLUE_FERN)), msg("m2", ("r.pdf", RECEIPT), minutes=1)],
+                      SCRIPT, drive=RefusingDrive("BF-2041"))
+    report = w.mailroom.run()
+    assert kinds(report) == [("a.pdf", "deferred", "drive_refused"), ("r.pdf", "filed", "")]
+    assert w.ledger.pending_writes() == []      # refused before it was sent: nothing to settle
+    w.mailroom.run()
+    [out] = w.mailroom.run().outcomes
+    assert out.kind is OutcomeKind.CONFLICT and "cannot do that" in out.reason
+    assert w.ledger.message_done("m1") and list(w.drive.tree()) == [RECEIPT_PATH]
+
+
+def test_a_folder_name_held_by_a_conflicted_folder_does_not_stop_the_run(world_factory):
+    w = world_factory([msg("m1", ("a.pdf", BLUE_FERN)), msg("m2", ("r.pdf", RECEIPT), minutes=1)],
+                      SCRIPT)
+    w.ledger.begin_write("x1", "folder", "root", "Invoices")
+    w.ledger.mark_conflict("x1", "the stored copy is in the trash")
+    assert kinds(w.mailroom.run()) == [("a.pdf", "deferred", "drive_refused"),
+                                       ("r.pdf", "filed", "")]
+
+
+class QuotaDrive(InMemoryDrive):
+    def reserve_ids(self, count):
+        raise DriveError("storage quota exceeded")
+
+
+def test_a_filing_the_drive_keeps_refusing_is_reported_and_becomes_a_conflict(world_factory):
+    w = world_factory([msg("m1", ("a.pdf", BLUE_FERN))], SCRIPT, drive=QuotaDrive("root"))
+    for _ in range(2):
+        report = w.mailroom.run()
+        assert kinds(report) == [("a.pdf", "deferred", "drive_refused")]
+        assert any("storage quota exceeded" in e for e in report.errors)
+    [out] = w.mailroom.run().outcomes
+    assert out.kind is OutcomeKind.CONFLICT and "storage quota exceeded" in out.reason
+    assert w.ledger.message_done("m1")
+
+
+@pytest.mark.parametrize("make_error", [
+    lambda: TransportError("connection reset"),
+    lambda: HttpError(503, "backend error"),
+    lambda: HttpError(403, "User Rate Limit Exceeded", reason="userRateLimitExceeded"),
+], ids=["network", "server", "rate-limit"])
+def test_a_drive_that_does_not_answer_is_retried_every_run_and_reported(world_factory,
+                                                                       make_error):
+    class DownDrive(InMemoryDrive):
+        down = True
+
+        def reserve_ids(self, count):
+            if self.down:
+                raise make_error()
+            return super().reserve_ids(count)
+
+    drive = DownDrive("root")
+    w = world_factory([msg("m1", ("a.pdf", BLUE_FERN))], SCRIPT, drive=drive)
+    for _ in range(5):
+        report = w.mailroom.run()
+        assert kinds(report) == [("a.pdf", "deferred", "drive_unavailable")]
+        assert report.errors
+    drive.down = False
+    assert kinds(w.mailroom.run()) == [("a.pdf", "filed", "")]
+
+
+class RevokedMailbox(InMemoryMailbox):
+    def get_message(self, message_id):
+        raise AuthError("Google refused the refresh token; reconnect the account")
+
+
+def test_revoked_credentials_stop_the_run_instead_of_failing_message_by_message(world_factory):
+    w = world_factory([msg("m1", ("a.pdf", BLUE_FERN))], SCRIPT)
+    w.mailroom.mailbox = RevokedMailbox([msg("m1", ("a.pdf", BLUE_FERN))])
+    for _ in range(4):
+        with pytest.raises(AuthError):
+            w.mailroom.run()
+    assert not w.ledger.message_done("m1") and w.ledger.outcomes() == []
+
+
+def test_a_mailbox_listing_cut_short_is_reported(world_factory):
+    w = world_factory([msg("m1", ("a.pdf", BLUE_FERN))], SCRIPT)
+    w.mailbox.listing_truncated = True
+    report = w.mailroom.run()
+    assert kinds(report) == [("a.pdf", "filed", "")]
+    assert any("mailbox.query" in e for e in report.errors)
 
 
 def test_documents_inside_zips_and_batch_pdfs_are_each_filed(world_factory):

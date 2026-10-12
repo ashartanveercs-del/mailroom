@@ -23,12 +23,14 @@ class TransportError(Exception):
 
 
 class HttpError(Exception):
-    """The server answered with an error status after retries."""
+    """The server answered with an error status after retries. `reason` is the API's own
+    code for the error when it gives one (a 403 can be a rate limit or a full drive)."""
 
-    def __init__(self, status: int, message: str) -> None:
+    def __init__(self, status: int, message: str, *, reason: str = "") -> None:
         super().__init__(f"HTTP {status}: {message}")
         self.status = status
         self.message = message
+        self.reason = reason
 
 
 @dataclass(frozen=True)

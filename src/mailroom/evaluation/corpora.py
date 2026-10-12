@@ -11,11 +11,14 @@ each document, including the mistakes real models make.
                sent and spam mail that must never be taken in
   containers   zips, forwarded emails, a batch scan of several invoices, an unsure batch,
                an encrypted zip, a zip bomb, nesting past the depth limit, a locked PDF,
-               a signature file
+               a signature file, a PDF whose sender calls it a Drive folder, and attachment
+               names that mimic the keys other attachments get
   adversarial  the model is wrong in every way it can be: confident on a look-alike, a
                hallucinated number, vendor and date, a label that contradicts the document,
                a prompt injection, garbage output, an outage, over-confidence on a blurry
-               photo; plus re-sent and corrected documents and a path-traversal vendor name
+               photo, and real values in the wrong role (the due date as the date, the
+               ship-to party or the owner's own name as the vendor); plus re-sent and
+               corrected documents and a path-traversal vendor name
 """
 
 from __future__ import annotations
@@ -57,6 +60,7 @@ class Corpus:
     expected: Mapping[str, Expected]
     existing: tuple[tuple[str, bytes], ...] = ()  # the owner's files already on the drive
     vendors: tuple[str, ...] = VENDORS
+    owner_names: tuple[str, ...] = (CLIENT,)
 
 
 # --- document text ---------------------------------------------------------------------
@@ -362,6 +366,27 @@ def _containers() -> Corpus:
     b.expect("c11/BF-2160.pdf", "filed",
              f"{INV}/Blue Fern Hosting/2026-05-14 Blue Fern Hosting BF-2160.pdf")
     b.expect("c11/smime.p7s", "skipped", reason="signature_file")
+
+    # the sender says this PDF is a Drive folder: the stored type comes from the bytes, so a
+    # Google type never reaches an upload (refused as a folder, or converted by Drive)
+    b.mail("c12", att("BF-2170.pdf", pdf(invoice("Blue Fern Hosting", "BF-2170", "06/14/2026",
+                                                  "$120.00")),
+                      "application/vnd.google-apps.folder"))
+    b.model("BF-2170", reply("invoice", 0.95, vendor="Blue Fern Hosting", number="BF-2170",
+                             date="2026-06-14"))
+    b.expect("c12/BF-2170.pdf", "filed",
+             f"{INV}/Blue Fern Hosting/2026-06-14 Blue Fern Hosting BF-2170.pdf")
+
+    # a third attachment named like the key the second one gets: each keeps its own key
+    b.mail("c13", *(att(name, pdf(receipt("Kestrel Couriers", number, day, "$5.00")))
+                    for name, number, day in (("scan.pdf", "KC-5801", "03/19/2026"),
+                                              ("scan.pdf", "KC-5802", "03/20/2026"),
+                                              ("scan.pdf#2", "KC-5803", "03/21/2026"))))
+    for number, day in (("KC-5801", "19"), ("KC-5802", "20"), ("KC-5803", "21")):
+        b.model(number, reply("receipt", 0.93, vendor="Kestrel Couriers", date=f"2026-03-{day}"))
+    for key, day in (("c13/scan.pdf", "19"), ("c13/scan.pdf#2", "20"),
+                     ("c13/scan.pdf#2#2", "21")):
+        b.expect(key, "filed", f"Receipts/2026-03/2026-03-{day} Kestrel Couriers receipt.pdf")
     return b.corpus()
 
 
@@ -491,6 +516,30 @@ def _adversarial() -> Corpus:
                                                        "03/26/2026", "$9.00")),
         vendor="Kestrel Couriers", number="KC-5730", date="2026-03-26"))
     b.expect("a17/IMG_2209.png", "review", f"{REVIEW}/IMG_2209.png", "classifiers_disagree")
+
+    # real values in the wrong role: each is in the text, so plain grounding passes, but the
+    # label in front of it says it is something else
+    b.mail("a18", att("NG-7830.pdf", pdf(invoice("Northgate Office Supply", "NG-7830",
+                                                  "12/29/2025", "$66.00",
+                                                  "Due date: 01/28/2026"))))
+    b.model("NG-7830", reply("invoice", 0.95, vendor="Northgate Office Supply",
+                             number="NG-7830", date="2026-01-28"))      # the due date
+    b.expect("a18/NG-7830.pdf", "review", f"{REVIEW}/NG-7830.pdf", "wrong_role_date")
+
+    b.mail("a19", att("kestrel-5750.pdf", pdf(receipt("Kestrel Couriers", "KC-5750",
+                                                       "03/28/2026", "$21.00",
+                                                       "Ship to: Brightwater Coworking"))))
+    b.model("KC-5750", reply("receipt", 0.94, vendor="Brightwater Coworking",  # where it went
+                             date="2026-03-28"))
+    b.expect("a19/kestrel-5750.pdf", "review", f"{REVIEW}/kestrel-5750.pdf",
+             "wrong_role_vendor")
+
+    b.mail("a20", att("TA-4410.pdf", pdf(invoice("Tidewell Accounting", "TA-4410",
+                                                  "03/27/2026", "$450.00",
+                                                  f"Thank you, {CLIENT}, for your business"))))
+    b.model("TA-4410", reply("invoice", 0.95, vendor=CLIENT, number="TA-4410",  # the owner
+                             date="2026-03-27"))
+    b.expect("a20/TA-4410.pdf", "review", f"{REVIEW}/TA-4410.pdf", "vendor_is_owner")
     return b.corpus()
 
 

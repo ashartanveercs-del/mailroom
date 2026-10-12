@@ -26,6 +26,16 @@ def _message(response: Response) -> str:
         return f"HTTP {response.status}"
 
 
+def _error(response: Response) -> HttpError:
+    """The error Drive answered with, keeping its reason code (`userRateLimitExceeded`,
+    `storageQuotaExceeded`...): the status alone does not say whether to retry."""
+    try:
+        reason = str(response.json()["error"]["errors"][0]["reason"])[:100]
+    except (KeyError, IndexError, TypeError, ValueError):
+        reason = ""
+    return HttpError(response.status, _message(response), reason=reason)
+
+
 def _stored(meta: Any) -> StoredFile:
     if not isinstance(meta, dict) or not isinstance(meta.get("id"), str):
         raise HttpError(200, "Drive sent an unexpected file resource")
@@ -53,7 +63,7 @@ class GoogleDrive:
         query = urllib.parse.urlencode({"count": count, "space": "drive", "type": "files"})
         response = self._send("GET", f"{DRIVE}/files/generateIds?{query}")
         if response.status != 200:
-            raise HttpError(response.status, _message(response))
+            raise _error(response)
         ids = response.json().get("ids") or []
         if len(ids) < count or not all(isinstance(i, str) for i in ids):
             raise HttpError(200, "Drive returned too few ids")
@@ -66,7 +76,7 @@ class GoogleDrive:
             raise AlreadyExists(_message(response))
         if response.status == 404:
             raise DriveError(f"the parent folder was not found: {_message(response)}")
-        raise HttpError(response.status, _message(response))
+        raise _error(response)
 
     def create_folder(self, folder_id: str, name: str, parent_id: str) -> StoredFile:
         meta = {"id": folder_id, "name": name, "mimeType": FOLDER_MIME, "parents": [parent_id]}
@@ -92,7 +102,7 @@ class GoogleDrive:
         if response.status == 404:
             return None
         if response.status != 200:
-            raise HttpError(response.status, _message(response))
+            raise _error(response)
         return _stored(response.json())
 
     def find_children(self, parent_id: str, name: str,
@@ -108,7 +118,7 @@ class GoogleDrive:
                 params["pageToken"] = token
             response = self._send("GET", f"{DRIVE}/files?{urllib.parse.urlencode(params)}")
             if response.status != 200:
-                raise HttpError(response.status, _message(response))
+                raise _error(response)
             data = response.json()
             found += [f for f in map(_stored, data.get("files") or []) if f.name == name]
             token = cursor.advance(data.get("nextPageToken"))

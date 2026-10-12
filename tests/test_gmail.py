@@ -81,6 +81,24 @@ def test_a_message_round_trips_with_its_attachments():
     assert b"inner.pdf" in got.attachments[4].data
 
 
+def test_attachment_ids_as_long_as_the_ones_gmail_issues_are_fetched():
+    sim, _, mailbox = build([message("m1", Attachment("a.pdf", "application/pdf", PDF))])
+    [att] = mailbox.get_message("m1").attachments
+    assert att.data == PDF
+    [url] = [u for _, u in sim.requests if "/attachments/" in u]
+    assert len(url.rsplit("/", 1)[1]) > 256
+
+
+def test_a_listing_longer_than_the_page_cap_keeps_the_newest_messages_and_says_so():
+    msgs = [message(f"m{i:02d}", minutes=i) for i in range(30)]
+    _, _, mailbox = build(msgs)
+    mailbox.max_pages = 10                                 # 10 pages of 2: 20 of the 30
+    assert mailbox.list_message_ids("") == [f"m{i:02d}" for i in range(10, 30)]
+    assert mailbox.listing_truncated
+    mailbox.max_pages = 15
+    assert len(mailbox.list_message_ids("")) == 30 and not mailbox.listing_truncated
+
+
 def test_oversized_attachments_are_skipped_without_being_downloaded():
     sim, _, mailbox = build([message("m1", Attachment("big.pdf", "application/pdf", PDF))])
     mailbox.max_attachment_bytes = 100

@@ -1,4 +1,5 @@
 import hashlib
+import json
 
 import pytest
 
@@ -6,6 +7,7 @@ from mailroom.app import google_stack
 from mailroom.filing import Filer
 from mailroom.google.drive import GoogleDrive
 from mailroom.guard import BlockedRequest
+from mailroom.http import HttpError, Response
 from mailroom.ledger import Ledger
 from mailroom.ports import AlreadyExists, DriveError
 from mailroom.sim.faults import CrashPlan, SimulatedCrash
@@ -37,6 +39,17 @@ def test_create_and_read_back(setup):
     assert drive.get(fid) == stored
     assert sim.drive.data(fid) == b"bytes" and sim.drive.description(fid) == "a note"
     assert drive.get("does-not-exist") is None
+
+
+@pytest.mark.parametrize("mime", ["application/vnd.google-apps.folder",
+                                  "application/vnd.google-apps.document"])
+def test_the_adapter_never_asks_drive_for_a_google_type(setup, mime):
+    # a Google type would make Drive convert the upload (or refuse it as a folder)
+    sim, _, drive = setup
+    [fid] = drive.reserve_ids(1)
+    stored = drive.create_file(fid, "a.pdf", sim.root_id, b"%PDF-1.4 bytes", mime)
+    assert stored.mime_type == "application/octet-stream"
+    assert sim.drive.data(fid) == b"%PDF-1.4 bytes"
 
 
 def test_a_second_create_with_the_same_id_is_already_exists(setup):
@@ -72,6 +85,26 @@ def test_trash_state_is_reported(setup):
     fid = sim.drive.add_file("a.pdf", sim.root_id, b"1")
     sim.drive.trash(fid)
     assert drive.get(fid).trashed
+
+
+class Canned:
+    def __init__(self, response):
+        self.response = response
+
+    def send(self, request):
+        return self.response
+
+
+def test_drive_errors_keep_the_reason_google_gives():
+    # a 403 can be a rate limit (retry later) or a full drive (a person must act)
+    body = json.dumps({"error": {"code": 403, "message": "User Rate Limit Exceeded",
+                                 "errors": [{"reason": "userRateLimitExceeded"}]}}).encode()
+    with pytest.raises(HttpError) as err:
+        GoogleDrive(Canned(Response(403, {}, body))).reserve_ids(1)
+    assert (err.value.status, err.value.reason) == (403, "userRateLimitExceeded")
+    with pytest.raises(HttpError) as err:
+        GoogleDrive(Canned(Response(500, {}, b"<html>oops</html>"))).reserve_ids(1)
+    assert (err.value.status, err.value.reason) == (500, "")
 
 
 def test_the_guard_blocks_uploads_outside_the_managed_tree_even_without_the_filer(setup):

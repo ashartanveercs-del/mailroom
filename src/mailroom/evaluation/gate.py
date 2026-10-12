@@ -123,7 +123,8 @@ class World:
             raise ValueError(f"unknown transport {transport!r}")
         self.corpus = corpus
         self.transport = transport
-        self.policy = Policy(types=DEFAULT_TYPES, **dict(policy_overrides or {}))
+        self.policy = Policy(types=DEFAULT_TYPES, owner_names=corpus.owner_names,
+                             **dict(policy_overrides or {}))
         self.model = SimulatedModel(corpus.script)
         self.sim: SimulatedGoogle | None = None
         if transport == "memory":

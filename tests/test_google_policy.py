@@ -3,7 +3,7 @@ import urllib.parse
 
 import pytest
 
-from mailroom.google.multipart import build_related, parse_related
+from mailroom.google.multipart import build_related, parse_related, safe_mime
 from mailroom.google.policy import (
     DRIVE,
     FOLDER_MIME,
@@ -41,6 +41,8 @@ UPLOAD_URL = UPLOAD + "?uploadType=multipart&fields=id"
     ("GET", GMAIL + "/messages?q=x&maxResults=100&pageToken=0987654321", "gmail.messages.list"),
     ("GET", GMAIL + "/messages/18c2f0a1b2?format=full", "gmail.messages.get"),
     ("GET", GMAIL + "/messages/18c2f0a1b2/attachments/ANGjdJ_x-1", "gmail.attachments.get"),
+    ("GET", GMAIL + "/messages/18c2f0a1b2/attachments/ANGjdJ" + "8Lw_-Qz" * 60,
+     "gmail.attachments.get"),
     ("GET", DRIVE + "/files/generateIds?count=1&space=drive&type=files",
      "drive.files.generateIds"),
     ("GET", DRIVE + "/files/abc123?fields=id%2Cname%2Cparents", "drive.files.get"),
@@ -112,6 +114,9 @@ def test_everything_else_is_blocked(method, url):
     ({"parents": ["folder-1", "root"]}, "exactly one parent"),
     ({"parents": ["someone-elses-folder"]}, "managed"),
     ({"parents": ["root"], "mimeType": FOLDER_MIME}, "folder"),
+    ({"mimeType": "application/vnd.google-apps.document"}, "Google"),
+    ({"mimeType": "application/vnd.google-apps.spreadsheet"}, "Google"),
+    ({"mimeType": "Application/Vnd.Google-Apps.Script"}, "Google"),
     ({"writersCanShare": True}, "metadata"),
     ({"name": ""}, "name"),
 ])
@@ -156,6 +161,12 @@ def test_a_sender_supplied_mime_type_cannot_inject_headers_into_the_upload():
     body, content_type = build_related({"id": "x"}, b"data", "application/pdf\r\nX-Evil: 1")
     [_, (media_headers, _)] = parse_related(body, content_type)
     assert media_headers == {"content-type": "application/octet-stream"}
+
+
+@pytest.mark.parametrize("mime", ["application/vnd.google-apps.folder",
+                                  "application/vnd.google-apps.document", "text/plain\r\nX: 1"])
+def test_safe_mime_never_passes_a_google_type_or_a_malformed_one(mime):
+    assert safe_mime(mime) == "application/octet-stream"
 
 
 def test_drive_query_escapes_quotes_and_backslashes():

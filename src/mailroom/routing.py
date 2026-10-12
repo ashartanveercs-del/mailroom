@@ -7,7 +7,10 @@
     (a higher bar for image-only documents, whose only text is the model's own reading)
   * the rule classifier, if it has an opinion, agrees, and has not ruled the type out
   * every field the folder and file-name templates use is present and *grounded*: it appears
-    in the document's own text (dates in the configured day/month order)
+    in the document's own text (dates in the configured day/month order), and in its own
+    role: not only right after a label that gives it another one (the customer after "Bill
+    to" is not the vendor, a deadline after "Due" is not the document's date)
+  * the vendor is not one of the owner's own names (the most common wrong pick on a bill)
 
 Anything else goes to the review folder with the first reason that failed. Templates are a
 tiny format of their own, not `str.format`, so a value can never reach attributes or add
@@ -26,7 +29,7 @@ from pathlib import PurePosixPath
 from typing import TYPE_CHECKING
 
 from .models import Classification, Destination, Document
-from .textutil import contains_phrase, find_dates, normalize
+from .textutil import contains_phrase, date_spans, find_dates, normalize
 
 if TYPE_CHECKING:
     from .classify import RuleOpinion
@@ -35,6 +38,29 @@ TEMPLATE_FIELDS = frozenset({"vendor", "date", "number", "title", "total", "type
 _PLACEHOLDER = re.compile(r"\{([^{}]*)\}")
 _DATE_SPEC = re.compile(r"(?:%[YmdBby]|[^%{}])+")
 MAX_SEGMENT = 100
+
+# Labels that put a value in a role other than the one its field needs: a name found only
+# after "Bill to" is the customer, not the vendor; a date found only after "Due" or "Valid
+# until" is a deadline, not the date of the document. Only labels that cannot mean the
+# field's own role are listed ("Client" can name the other party of a contract, which is
+# what the vendor field holds there; "Payment date" is a receipt's own date). English, like
+# the default types.
+OTHER_ROLE_LABELS: Mapping[str, tuple[str, ...]] = {
+    "vendor": ("bill to", "billed to", "invoice to", "sold to", "ship to", "shipped to",
+               "deliver to", "delivered to", "customer"),
+    "date": ("due", "due date", "pay by", "valid until", "valid till", "expires", "expiry",
+             "expiry date", "expiration date", "delivery date", "ship date", "shipped",
+             "renewal date"),
+}
+
+
+def _label_pattern(labels: tuple[str, ...]) -> re.Pattern[str]:
+    # at the end of the normalised text in front of a value, maybe followed by on/by/at
+    words = sorted({re.escape(normalize(label)) for label in labels}, key=len, reverse=True)
+    return re.compile(rf"(?:^|\s)(?:{'|'.join(words)})(?:\s(?:on|by|at))?$")
+
+
+_OTHER_ROLE = {name: _label_pattern(labels) for name, labels in OTHER_ROLE_LABELS.items()}
 
 
 class TemplateError(ValueError):
@@ -130,6 +156,7 @@ class Policy:
     grounding: bool = True
     date_order: str = "MDY"
     vision_min_confidence: float = 0.95
+    owner_names: tuple[str, ...] = ()  # the owner's own business: never anyone's vendor
 
     def __post_init__(self) -> None:
         for spec in self.types.values():
@@ -143,6 +170,41 @@ def _grounded(name: str, value: str, evidence: str, order: str) -> bool:
     if name == "date":
         return date.fromisoformat(value) in find_dates(evidence, order)
     return contains_phrase(evidence, value)
+
+
+def _lead_ins(name: str, value: str, line: str, order: str) -> list[str]:
+    """The normalised text in front of each place `value` appears on `line`."""
+    if name == "date":
+        wanted = date.fromisoformat(value)
+        return [normalize(line[:start]) for start, found in date_spans(line, order)
+                if found == wanted]
+    text, needle = normalize(line), normalize(value)
+    if not needle:
+        return []
+    return [text[:m.start()].rstrip()
+            for m in re.finditer(rf"(?<!\w){re.escape(needle)}(?!\w)", text)]
+
+
+def _only_in_another_role(name: str, value: str, evidence: str, order: str) -> bool:
+    """True if `value` appears in `evidence` and every time right after a label for another
+    role: on its own line, or on the line above when the value starts its line (a label set
+    above its value). One appearance in no such place is enough to be in its own role."""
+    pattern = _OTHER_ROLE.get(name)
+    if pattern is None:
+        return False
+    seen, above = False, ""
+    for line in evidence.splitlines():
+        for lead in _lead_ins(name, value, line, order):
+            seen = True
+            if not pattern.search(lead or above):
+                return False
+        above = normalize(line) or above
+    return seen
+
+
+def _is_owner(value: str, owner_names: tuple[str, ...]) -> bool:
+    return any(contains_phrase(value, owner) or contains_phrase(owner, value)
+               for owner in owner_names)
 
 
 def decide(doc: Document, verdict: Classification, opinion: RuleOpinion | None,
@@ -183,6 +245,11 @@ def decide(doc: Document, verdict: Classification, opinion: RuleOpinion | None,
             values[name] = value
         if policy.grounding and not _grounded(name, value, evidence, policy.date_order):
             return review(f"ungrounded_{name}")
+        if name == "vendor" and _is_owner(value, policy.owner_names):
+            return review("vendor_is_owner")
+        if policy.grounding and _only_in_another_role(name, value, evidence,
+                                                      policy.date_order):
+            return review(f"wrong_role_{name}")
     try:
         folder = render_folder(spec.folder, values)
         name = sanitize_segment(_render(spec.filename, values), 120) + _extension(doc)

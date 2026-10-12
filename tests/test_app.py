@@ -1,4 +1,5 @@
 import json
+from datetime import timedelta
 
 import pytest
 
@@ -72,6 +73,31 @@ def test_the_rule_classifier_needs_no_model_or_key(tmp_path):
     app.close()
     assert [o.path for o in report.outcomes] == [PATH]
     assert model.requests == []
+
+
+def test_a_sender_chosen_google_type_neither_stops_intake_nor_reaches_drive(tmp_path):
+    # From can be forged and allowed_senders is a filter: anyone can send this
+    second = make_pdf([["Blue Fern Hosting", "INVOICE", "Invoice No: BF-2077",
+                        "Invoice date: 04/14/2026", "Amount due: $120.00"]])
+    hostile = (Attachment("BF-2041.pdf", "application/vnd.google-apps.folder", INVOICE),
+               Attachment("BF-2077.pdf", "application/vnd.google-apps.document", second))
+    messages = [Message("m0", "Billing <billing@example.com>", "Invoices", T0,
+                        frozenset({"INBOX"}), hostile),
+                Message("m1", "Billing <billing@example.com>", "Later", T0 + timedelta(hours=1),
+                        frozenset({"INBOX"}), (Attachment("note.txt", "text/plain",
+                                                          b"Thanks for the order"),))]
+    google = SimulatedGoogle(messages, root_id="root")
+    model = SimulatedModel([Scripted("BF-2041", REPLY), Scripted("BF-2077", {
+        **REPLY, "fields": {**REPLY["fields"], "number": "BF-2077", "date": "2026-04-14"}})])
+    app = build_app(settings(tmp_path), google_wire=google, llm_wire=model,
+                    env={"MAILROOM_LLM_API_KEY": "sk-test"}, sleep=lambda s: None)
+    report = app.mailroom.run()
+    app.close()
+    assert [(o.key, o.kind.value) for o in report.outcomes] == [
+        ("m0/BF-2041.pdf", "filed"), ("m0/BF-2077.pdf", "filed"), ("m1/note.txt", "review")]
+    stored = {o.key: google.drive.get(o.file_id).mime_type for o in report.outcomes}
+    assert stored == {"m0/BF-2041.pdf": "application/pdf", "m0/BF-2077.pdf": "application/pdf",
+                      "m1/note.txt": "text/plain"}
 
 
 def test_a_missing_api_key_stops_before_anything_runs(tmp_path):

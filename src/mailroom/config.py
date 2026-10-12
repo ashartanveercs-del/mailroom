@@ -26,7 +26,7 @@ SECTIONS: dict[str, frozenset[str]] = {
     "google": frozenset({"credentials_file"}),
     "classifier": frozenset({"kind", "endpoint", "model", "api_key_env", "cross_check",
                              "grounding", "date_order", "vision_min_confidence", "vendors",
-                             "max_attempts"}),
+                             "owner_names", "max_attempts"}),
     "ledger": frozenset({"path"}),
     "split": frozenset({"enabled"}),
 }
@@ -58,6 +58,7 @@ class Settings:
     date_order: str = "MDY"
     vision_min_confidence: float = 0.95
     vendors: tuple[str, ...] = ()
+    owner_names: tuple[str, ...] = ()
     max_attempts: int = 3
     split: bool = True
     types: Mapping[str, DocType] = field(default_factory=lambda: dict(DEFAULT_TYPES))
@@ -66,7 +67,8 @@ class Settings:
         return Policy(types=self.types, review_folder=self.review_folder,
                       cross_check=self.cross_check, grounding=self.grounding,
                       date_order=self.date_order,
-                      vision_min_confidence=self.vision_min_confidence)
+                      vision_min_confidence=self.vision_min_confidence,
+                      owner_names=self.owner_names)
 
     def api_key(self, env: Mapping[str, str]) -> str:
         value = env.get(self.api_key_env, "").strip()
@@ -161,6 +163,8 @@ def _parse(raw: dict[str, Any], base: Path) -> Settings:
             clf["vision_min_confidence"], (int, float), "classifier.vision_min_confidence"))
     if "vendors" in clf:
         kwargs["vendors"] = _strings(clf["vendors"], "classifier.vendors")
+    if "owner_names" in clf:
+        kwargs["owner_names"] = _strings(clf["owner_names"], "classifier.owner_names")
     if "max_attempts" in clf:
         kwargs["max_attempts"] = int(_positive(clf["max_attempts"], "classifier.max_attempts"))
     if kind == "llm":

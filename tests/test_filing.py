@@ -109,6 +109,20 @@ def test_a_trashed_folder_is_replaced_not_written_into(world):
     assert drive.tree() == {"Invoices/a.pdf": md5(b"x")}
 
 
+def test_a_folder_restored_from_the_trash_is_used_again(world):
+    drive, ledger, _ = world
+    original = Filer(drive, ledger).folder(("Invoices",))
+    drive.trash(original)
+    replacement = Filer(drive, ledger).folder(("Invoices",))
+    assert replacement != original
+    drive.trash(replacement)
+    drive.restore(original)                              # the owner undoes the first delete
+    folder = Filer(drive, ledger).folder(("Invoices", "2027"))
+    Filer(drive, ledger).file("m1/a.pdf", b"x", "a.pdf", folder, PDF)
+    assert drive.tree() == {"Invoices/2027/a.pdf": md5(b"x")}
+    assert ledger.managed_folder(original)
+
+
 def test_the_filer_refuses_folders_outside_the_managed_tree(world):
     drive, ledger, _ = world
     elsewhere = drive.add_folder("Not ours", None)

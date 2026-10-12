@@ -1,10 +1,11 @@
 import io
+import time
 import zipfile
 from email.message import EmailMessage
 
 import pytest
 
-from mailroom.containers import Limits, docx_text, sniff, unpack
+from mailroom.containers import Limits, UniqueNames, docx_text, sniff, unpack
 from mailroom.sim.files import make_docx, make_png, make_zip
 from mailroom.sim.pdfgen import make_pdf
 
@@ -35,6 +36,40 @@ def test_sniff_prefers_content_over_names(data, filename, mime, expected):
 def test_docx_text_reads_paragraphs():
     assert docx_text(make_docx(["Service Agreement", "between two parties"])) == (
         "Service Agreement\nbetween two parties")
+
+
+def word_xml(body: str) -> bytes:
+    return make_zip({"word/document.xml": f"<w:document><w:body>{body}</w:body></w:document>"
+                     .encode()})
+
+
+def test_docx_text_stays_fast_when_paragraphs_are_never_closed():
+    # a few hundred bytes zipped; a pattern that rescans to the end from every open <w:p>
+    # takes tens of seconds on this, and the work quadruples each time the input doubles
+    hostile = word_xml("<w:p><w:r><w:t>x</w:t></w:r>" * 30_000)
+    started = time.perf_counter()
+    assert docx_text(hostile) == ""
+    assert time.perf_counter() - started < 2.0
+
+
+def test_docx_text_keeps_closed_paragraphs_around_an_unclosed_one():
+    xml = word_xml("<w:p><w:r><w:t>kept</w:t></w:r></w:p><w:p><w:r><w:t>never closed"
+                   "<w:p><w:r><w:t>also kept</w:t></w:r></w:p>")
+    assert docx_text(xml) == "kept\nalso kept"
+
+
+def test_docx_text_reads_text_box_paragraphs_inside_a_paragraph():
+    xml = word_xml('<w:p><w:pPr><w:jc w:val="left"/></w:pPr><w:r><w:t>Invoice No:</w:t>'
+                   "<w:tab/></w:r><w:r><w:pict><w:txbxContent><w:p><w:r><w:t>boxed</w:t>"
+                   '</w:r></w:p></w:txbxContent></w:pict></w:r><w:r><w:t xml:space="preserve">'
+                   " INV-7 &amp; more</w:t></w:r></w:p><w:p/><w:p><w:r><w:t/></w:r></w:p>")
+    # the text box comes out as its own paragraph and does not cut the one around it in two
+    assert docx_text(xml) == "boxed\nInvoice No: INV-7 & more"
+
+
+def test_docx_text_refuses_an_absurd_number_of_paragraphs():
+    with pytest.raises(ValueError, match="paragraphs"):
+        docx_text(word_xml("<w:p></w:p>" * 50), max_paragraphs=40)
 
 
 # --- plain files ---------------------------------------------------------------------------
@@ -89,6 +124,25 @@ def test_identical_member_paths_get_distinct_origins():
             zf.writestr("x.pdf", PDF + b" ")
     origins = [i.origin for i in unpack("in.zip", "", buf.getvalue()).items]
     assert origins == ["in.zip/x.pdf", "in.zip/x.pdf#2"]
+
+
+def test_a_member_named_like_a_generated_suffix_still_gets_its_own_origin():
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("x.pdf", PDF)
+        with pytest.warns(UserWarning):
+            zf.writestr("x.pdf", PDF + b" ")
+        zf.writestr("x.pdf#2", PDF + b"  ")
+    origins = [i.origin for i in unpack("in.zip", "", buf.getvalue()).items]
+    assert origins == ["in.zip/x.pdf", "in.zip/x.pdf#2", "in.zip/x.pdf#2#2"]
+
+
+def test_many_members_with_one_name_get_distinct_origins_quickly():
+    names = UniqueNames()
+    started = time.perf_counter()
+    claimed = [names.claim("a.pdf") for _ in range(20_000)]
+    assert len(set(claimed)) == 20_000 and claimed[:3] == ["a.pdf", "a.pdf#2", "a.pdf#3"]
+    assert time.perf_counter() - started < 1.0
 
 
 def test_encrypted_zip_is_kept_whole_and_flagged():

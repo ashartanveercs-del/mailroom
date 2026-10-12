@@ -97,7 +97,15 @@ def test_the_adversarial_corpus_needs_every_safety_check():
                if e.kind == "review"}
     assert {"ruled_out_by_rules", "classifiers_disagree", "low_confidence",
             "ungrounded_number", "ungrounded_vendor", "ungrounded_date", "missing_date",
-            "possible_revision", "classifier_unavailable"} <= reasons
+            "possible_revision", "classifier_unavailable", "wrong_role_vendor",
+            "wrong_role_date", "vendor_is_owner"} <= reasons
+
+
+def test_the_containers_corpus_covers_lying_types_and_names_that_mimic_keys():
+    corpus = get_corpus("containers")
+    declared = {a.filename: a.mime_type for m in corpus.messages for a in m.attachments}
+    assert declared["BF-2170.pdf"] == "application/vnd.google-apps.folder"
+    assert {"c13/scan.pdf", "c13/scan.pdf#2", "c13/scan.pdf#2#2"} <= set(corpus.expected)
 
 
 # --- the gate ------------------------------------------------------------------------------
