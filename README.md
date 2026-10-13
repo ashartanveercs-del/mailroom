@@ -1,15 +1,31 @@
 # mailroom
 
-**Files the documents that arrive by email into the right cloud-drive folder, without ever
-changing the mailbox, overwriting a file, or losing track of a document when the process dies
-halfway.** Invoices, receipts and contracts come in through Gmail (as attachments, inside zips,
-inside forwarded emails, or as several documents scanned into one PDF). They are classified by
-an LLM/vision model that is never trusted on its own, and filed into Google Drive as
-`Invoices/2026/Blue Fern Hosting/2026-03-14 Blue Fern Hosting BF-2041.pdf`. Anything short of
-certain goes to a review folder with a reason.
+**Restartable inbox-to-Drive filing with an executable misfile gate.**
+Classify invoices, receipts and contracts from Gmail attachments, ZIPs, forwarded emails and
+batch PDFs. Read-only mailbox intake and create-only Drive requests are enforced by a wire
+allowlist; a SQLite write-ahead ledger preserves filing plans across interrupted uploads.
+Uncertain classifications go to a review folder with a reason.
 
+[![CI](https://github.com/ashartanveercs-del/mailroom/actions/workflows/ci.yml/badge.svg)](https://github.com/ashartanveercs-del/mailroom/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13-blue)
-![License: MIT](https://img.shields.io/badge/license-MIT-green)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
+[Quick start](#quick-start) | [Architecture](#architecture) | [Evaluation gate](#the-evaluation-gate) | [Verification & proof map](docs/VERIFICATION.md) | [Security boundaries](#security-notes)
+
+- **Idempotency is planned:** reserve a Drive id and commit the upload intent before sending bytes; verify the stored copy before recording success.
+- **Classification must earn a folder:** require rule agreement, text grounding and field roles; changed copies of an already-filed document go to review.
+- **Failures are part of the evaluation:** 27 offline cells cover live, preview and crash recovery across three transports. The latest run exercised 461 crash points with zero misfiles, mismatches or boundary violations.
+
+## Try it offline
+
+```bash
+python -m pip install -e ".[dev]"
+python -m mailroom demo
+python -m mailroom eval --json eval-report.json
+```
+
+No Google account or model key is needed. The production Gmail/Drive adapters run against an
+in-process Google API simulator and a scripted model. The demo produces:
 
 ```text
 $ mailroom demo
@@ -35,7 +51,7 @@ requests the allowlist let through, by rule:
 | **Classification that has to show its work** | A pluggable LLM/vision classifier proposes a type and fields. They are used only if confidence clears the type's threshold, an independent rule classifier doesn't disagree, and every value that goes into a folder or file name appears in the document's own text, in the role its field needs: not the bill-to party as the vendor, not the due date as the date. |
 | **One bad message never stops the queue** | A failure counts against the one document or message it happened in. Drive not answering is retried every run and reported; a refusal, or a message that keeps failing, becomes a conflict for a person after 3 runs. Only a failure that is no one message's (refused credentials, a mailbox that cannot be listed) stops a run. |
 | **An offline gate with zero tolerance** | 3 synthetic corpora (54 documents) x 3 transports x 3 modes (live, preview, a crash at every write) run with fakes for every external service. One misfile fails CI. |
-| **Tested without an account** | 426 tests, about 20 s, no network, no keys. The real Gmail/Drive adapters, allowlist, retries and OAuth run against an in-process simulation of the Google REST APIs. |
+| **Tested without an account** | 426 tests with no network or keys. The real Gmail/Drive adapters, allowlist, retries and OAuth run against an in-process simulation of the Google REST APIs. |
 
 ## Architecture
 
@@ -224,7 +240,8 @@ models make; it does not measure any real model's accuracy.
 Requirements: Python 3.11+. Nothing else for the offline parts.
 
 ```bash
-git clone <this repository> mailroom && cd mailroom
+git clone https://github.com/ashartanveercs-del/mailroom.git
+cd mailroom
 python -m venv .venv && source .venv/bin/activate      # Windows: .venv\Scripts\activate
 pip install -e ".[dev]"
 mailroom demo                 # a synthetic mailbox, filed through the real adapters, offline
@@ -292,7 +309,7 @@ keys are errors, so a typo fails at startup.
 ## Testing
 
 ```bash
-pytest                         # 426 tests, about 20 s, offline, no keys
+python -m pytest -q -ra         # 426 passed in the dated local verification
 ruff check src tests examples
 mailroom eval                  # the gate (also a separate CI step that uploads a JSON report)
 ```
@@ -303,7 +320,8 @@ with real wire formats, 409s, 404s, expiring tokens, attachment ids as long as G
 injected faults ([`sim/google_api.py`](src/mailroom/sim/google_api.py)), and the model as a scripted
 OpenAI-compatible endpoint ([`sim/model.py`](src/mailroom/sim/model.py)). Crashes are injected
 as a `BaseException`, so no `except Exception` in the code under test can swallow one, just as no
-handler runs when a real process is killed. CI runs lint, the tests and the gate on Python 3.11,
+handler runs when a real process is killed. A suite-wide socket/DNS tripwire rejects real
+network access. CI runs lint, the tests, the offline examples and the gate on Python 3.11,
 3.12 and 3.13.
 
 ## Security notes
