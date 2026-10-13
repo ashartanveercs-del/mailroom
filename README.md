@@ -373,6 +373,11 @@ network access. CI runs lint, the tests, the offline examples and the gate on Py
 - A cross-process run lock, and Gmail push notifications instead of polling.
 - An online evaluation mode that replays recorded real-model answers.
 
+## Secret scanning
+
+[Full-history audit and secret-scan CI](docs/SECURITY-AUDIT.md). Configuration examples and
+synthetic fixtures were reviewed before publication; new credential findings fail the gate.
+
 ## License
 
 MIT
